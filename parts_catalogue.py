@@ -14,6 +14,7 @@ Install:
 import os
 import math
 import logging
+import time
 from decimal import Decimal
 from typing import Any, Dict
 
@@ -486,6 +487,7 @@ ORDER BY "Material";
 # 写入路径 & 批大小
 BASE_PATH = "material_summary_2025"   # 如需沿用旧路径，改成 "bom_summary"
 BATCH = 500
+QUERY_TIMEOUT_SECONDS = 1800  # SQL 超时（秒），避免长时间无响应
 
 # 需要写入的列（按 SQL 输出列名）
 NUMERIC_COLS = [
@@ -568,12 +570,31 @@ def df_to_updates(df: pd.DataFrame) -> list[Dict[str, Dict[str, Any]]]:
         updates.append(chunk)
     return updates
 
+def _set_pyodbc_timeout(target: Any, timeout_seconds: int, scope: str) -> None:
+    try:
+        target.timeout = timeout_seconds
+    except pyodbc.Error as exc:
+        logger.warning(
+            "%s timeout is not supported by this ODBC driver; continue without timeout. (%s)",
+            scope,
+            exc,
+        )
+
 def main():
     logger.info("Connecting to SAP HANA via ODBC...")
     pyodbc.pooling = False
     with pyodbc.connect(DSN, autocommit=True) as conn:
-        logger.info("Running SQL...")
-        df = pd.read_sql(SQL, conn)
+        _set_pyodbc_timeout(conn, QUERY_TIMEOUT_SECONDS, "Connection")
+        logger.info("Running SQL (timeout=%ss)...", QUERY_TIMEOUT_SECONDS)
+        t0 = time.perf_counter()
+        cursor = conn.cursor()
+        _set_pyodbc_timeout(cursor, QUERY_TIMEOUT_SECONDS, "Cursor")
+        cursor.execute(SQL)
+        columns = [col[0] for col in cursor.description]
+        rows = cursor.fetchall()
+        elapsed = time.perf_counter() - t0
+        logger.info("SQL finished in %.1fs.", elapsed)
+        df = pd.DataFrame.from_records(rows, columns=columns)
 
     logger.info("Fetched %d rows.", len(df))
     if not df.empty:
